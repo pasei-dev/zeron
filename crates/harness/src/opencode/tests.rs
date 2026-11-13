@@ -267,7 +267,17 @@ impl TurnWire {
                         match path.as_str() {
                             "/api/health" => ("200 OK", health.as_str()),
                             "/api/session" => ("200 OK", r#"{"data":{"id":"fixture"}}"#),
+                            "/api/session/fixture" => (
+                                "200 OK",
+                                r#"{"data":{"id":"fixture","agent":"build"}}"#,
+                            ),
                             "/api/command" => ("200 OK", r#"{"data":[]}"#),
+                            // (Plan mode switches to the read-only primary
+                            // agent and back to the first primary one.)
+                            "/api/agent" => (
+                                "200 OK",
+                                r#"{"data":[{"id":"build","mode":"primary","hidden":false,"permissions":[{"action":"*","resource":"*","effect":"allow"}]},{"id":"plan","mode":"primary","hidden":true,"permissions":[{"action":"edit","resource":"*","effect":"deny"}]}]}"#,
+                            ),
                             // Non-empty: the catalog-sync retry loop must not stall tests.
                             "/api/model" => ("200 OK", r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true},{"providerID":"opencode","id":"long-context","name":"Long Context","limit":{"context":2000},"enabled":true}]}"#),
                             _ => ("200 OK", "{}"),
@@ -276,6 +286,10 @@ impl TurnWire {
                         match path.as_str() {
                             "/global/health" => ("200 OK", r#"{"healthy":true,"version":"1.18.31"}"#),
                             "/session" => ("200 OK", r#"{"id":"fixture"}"#),
+                            "/agent" => (
+                                "200 OK",
+                                r#"[{"id":"build","mode":"primary","hidden":false,"permissions":[{"action":"*","resource":"*","effect":"allow"}]},{"id":"plan","mode":"primary","hidden":true,"permissions":[{"action":"edit","resource":"*","effect":"deny"}]}]"#,
+                            ),
                             "/command" => (
                                 "200 OK",
                                 if native_command_reply.is_some() {
@@ -327,6 +341,7 @@ impl TurnWire {
             .extend(overrides.as_object().unwrap().clone());
         let run = tokio::spawn(run_session(Session {
             server: Server::attached(base),
+            plan_return: Arc::default(),
             event_tx,
             controls: RunControls {
                 realtime: None,
@@ -1532,6 +1547,46 @@ fn tool_names_type_the_common_calls() {
 }
 
 #[test]
+fn a_run_switches_agents_only_where_it_knows_where_to_go() {
+    // On: the plan agent.
+    assert_eq!(
+        agent_switch(true, Some("plan"), Some("build"), None, None).as_deref(),
+        Some("plan")
+    );
+    // Off, from the plan agent: back to what it was on before.
+    assert_eq!(
+        agent_switch(false, Some("plan"), Some("plan"), None, Some("build".into())).as_deref(),
+        Some("build")
+    );
+    // Off, from the plan agent, with nothing remembered: the one picked.
+    assert_eq!(
+        agent_switch(false, Some("plan"), Some("plan"), Some("mine"), None).as_deref(),
+        Some("mine")
+    );
+    // Off, from the plan agent, with neither: leave it alone.
+    assert_eq!(agent_switch(false, Some("plan"), Some("plan"), None, None), None);
+    // Off, from another agent: the one picked.
+    assert_eq!(
+        agent_switch(false, Some("plan"), Some("build"), Some("mine"), None).as_deref(),
+        Some("mine")
+    );
+}
+
+#[test]
+fn plan_agent_is_the_one_that_may_not_edit() {
+    let list = json!([
+        {"id": "orchestrator", "mode": "primary", "hidden": false,
+         "permissions": [{"action": "*", "resource": "*", "effect": "allow"}]},
+        {"id": "build", "mode": "primary", "hidden": false,
+         "permissions": [{"action": "*", "resource": "*", "effect": "allow"}]},
+        {"id": "plan", "mode": "primary", "hidden": true,
+         "permissions": [{"action": "edit", "resource": "*", "effect": "deny"}]},
+        {"id": "explore", "mode": "subagent", "hidden": false, "permissions": []}
+    ]);
+    assert_eq!(plan_agent_from(&list).as_deref(), Some("plan"));
+}
+
+#[test]
 fn commands_map_from_wire() {
     let wire = json!([
         {"name": "init", "description": "Create AGENTS.md"},
@@ -2161,15 +2216,19 @@ async fn plan_mode_sets_the_v2_session_agent() {
         .iter()
         .find(|(path, _)| path == "/api/session")
         .unwrap();
-    assert_eq!(created.1["agent"], "plan");
+    // (Made on the server's own default, then switched: leaving plan mode
+    // has somewhere to go back to.)
+    assert!(created.1["agent"].is_null());
     let switched: Vec<&Value> = posts
         .iter()
         .filter(|(path, _)| path == "/api/session/fixture/agent")
         .map(|(_, body)| body)
         .collect();
+    // (The fixture always reports the session on "build", so coming off plan
+    // mode has nothing to go back to and only the way on is posted.)
     assert_eq!(
         switched,
-        [&json!({"agent": "build"}), &json!({"agent": "plan"})]
+        [&json!({"agent": "plan"}), &json!({"agent": "plan"})]
     );
     assert!(
         posts
@@ -4001,6 +4060,7 @@ async fn wedged_run(base: String, timeouts: BusTimeouts) -> (Option<String>, Don
         json!({"prompt": "first", "cwd": "", "sandbox": "workspace-write", "autoApprove": true});
     tokio::spawn(run_session(Session {
         server: Server::attached(base),
+        plan_return: Arc::default(),
         event_tx,
         controls: RunControls {
             realtime: None,

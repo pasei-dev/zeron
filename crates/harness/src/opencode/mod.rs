@@ -373,6 +373,9 @@ pub struct OpencodeHarness {
     /// Coalesce concurrent picker/title probes: several cold opencode boots
     /// at once are slower than one.
     probe_lock: tokio::sync::Mutex<()>,
+    /// The agent a session was on before plan mode switched it away, by
+    /// session id, so leaving plan mode goes back to that one.
+    plan_return: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl Default for OpencodeHarness {
@@ -386,6 +389,7 @@ impl Default for OpencodeHarness {
             startup_timeout: startup_timeout(),
             models_cache: crate::catalog::Catalog::default(),
             commands_cache: tokio::sync::OnceCell::new(),
+            plan_return: Arc::default(),
             probe_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -520,10 +524,13 @@ impl OpencodeHarness {
             return Ok(commands.clone());
         }
         let mut server = self.server(None, None).await?;
-        let result = server
-            .commands_wire(None)
-            .await
-            .map(|v| commands_from_wire(&v));
+        let result = async {
+            let protocol = server.protocol().await;
+            let mut commands = commands_from_wire(&server.commands_wire(None).await?);
+            commands.extend(tui_commands(protocol));
+            Ok(commands)
+        }
+        .await;
         server.shutdown(self.kill_grace).await;
         result
     }
@@ -648,10 +655,89 @@ impl Harness for OpencodeHarness {
             .to_str()
             .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
         let mut server = self.server(Some(directory), None).await?;
-        let result = server
-            .commands_wire(Some(directory))
-            .await
-            .map(|v| commands_from_wire(&v));
+        let result = async {
+            let protocol = server.protocol().await;
+            let mut commands =
+                commands_from_wire(&server.commands_wire(Some(directory)).await?);
+            commands.extend(tui_commands(protocol));
+            Ok(commands)
+        }
+        .await;
+        server.shutdown(self.kill_grace).await;
+        result
+    }
+
+    fn supports_revert(&self) -> bool {
+        true
+    }
+
+    /// Forget everything from the session's `user_index`th prompt on: 2.x
+    /// stages a revert at that message and commits it. The agent's own ids
+    /// are its own (`msg_…`), so the prompt is found by its place among the
+    /// session's user messages. 1.x has no such call, so the transcript is
+    /// rewound without the agent's own session following it.
+    async fn revert(
+        &self,
+        session_id: &str,
+        user_index: usize,
+        text: &str,
+        cwd: &std::path::Path,
+    ) -> Result<bool, HarnessError> {
+        let _guard = self.probe_lock.lock().await;
+        let directory = cwd
+            .to_str()
+            .ok_or_else(|| HarnessError::Protocol("Project path is not UTF-8".into()))?;
+        let mut server = self.server(Some(directory), None).await?;
+        let result = async {
+            if server.protocol().await != Protocol::V2 {
+                return Ok(false);
+            }
+            let list = unwrap_data(
+                server
+                    .get_json(&format!("/api/session/{session_id}/message"), Some(directory))
+                    .await?,
+            );
+            let prompts: Vec<&Value> = list
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter(|m| m.get("type").and_then(Value::as_str) == Some("user"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // (The count lines up unless a command turn left no user message
+            // of its own; then the prompt's own words find it.)
+            let prompt = prompts
+                .get(user_index)
+                .filter(|prompt| prompt.get("text").and_then(Value::as_str) == Some(text))
+                .or_else(|| {
+                    prompts
+                        .iter()
+                        .rev()
+                        .find(|prompt| prompt.get("text").and_then(Value::as_str) == Some(text))
+                });
+            let Some(id) = prompt.and_then(|prompt| prompt.get("id")).and_then(Value::as_str)
+            else {
+                return Ok(false);
+            };
+            server
+                .post_json(
+                    &format!("/api/session/{session_id}/revert/stage"),
+                    Some(directory),
+                    &json!({ "messageID": id }),
+                )
+                .await?;
+            server
+                .post_json(
+                    &format!("/api/session/{session_id}/revert/commit"),
+                    Some(directory),
+                    &Value::Null,
+                )
+                .await?;
+            Ok(true)
+        }
+        .await;
         server.shutdown(self.kill_grace).await;
         result
     }
@@ -686,6 +772,7 @@ impl Harness for OpencodeHarness {
             kill_grace: self.kill_grace,
             bus_timeouts: self.bus_timeouts,
             known_commands: None, // Resolve the live session directory, never a global probe cache.
+            plan_return: self.plan_return.clone(),
             initial_native_command_selected,
         }));
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -1309,8 +1396,70 @@ impl Server {
             Protocol::V1 => "/command",
             Protocol::V2 => "/api/command",
         };
-        let raw = self.get_json(path, directory).await?;
-        Ok(unwrap_data(raw))
+        // A server answers for a directory whose instance it hasn't opened
+        // yet with what it knows before that instance is up: nothing at all,
+        // or only the built-ins, without the configuration's own commands —
+        // and an MCP server's prompt commands only once it has connected.
+        // A short answer then is a race, not a fact: read until the list
+        // stops changing and no MCP server is still connecting (5 s at
+        // most), as the model catalog polls for its own.
+        let started = tokio::time::Instant::now();
+        let mut last: Option<Value> = None;
+        loop {
+            let list = unwrap_data(self.get_json(path, directory).await?);
+            let settled = last.as_ref() == Some(&list);
+            let empty = list.as_array().is_some_and(|items| items.is_empty());
+            let pending = self.mcp_pending(directory).await;
+            // (An empty answer is worth waiting on for a moment — a cold
+            // instance fills it in — but not as long as a list that is
+            // merely still growing.)
+            let patience = if empty {
+                Duration::from_millis(1500)
+            } else {
+                Duration::from_secs(5)
+            };
+            let waited = started.elapsed();
+            if (!empty && settled && !pending && waited >= Duration::from_millis(900))
+                || waited >= patience
+            {
+                return Ok(list);
+            }
+            last = Some(list);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The agent plan mode switches to, read from the server rather than
+    /// named here: the primary one whose rules keep it from editing.
+    async fn plan_agent(&self, directory: Option<&str>) -> Option<String> {
+        let path = match self.protocol().await {
+            Protocol::V1 => "/agent",
+            Protocol::V2 => "/api/agent",
+        };
+        let list = self.get_json(path, directory).await.ok()?;
+        plan_agent_from(&unwrap_data(list))
+    }
+
+    /// Whether any MCP server is still connecting (2.x `GET /api/mcp`):
+    /// its prompt commands only join the catalog once it has.
+    async fn mcp_pending(&self, directory: Option<&str>) -> bool {
+        if self.protocol().await != Protocol::V2 {
+            return false;
+        }
+        let Ok(raw) = self.get_json("/api/mcp", directory).await else {
+            return false;
+        };
+        unwrap_data(raw)
+            .as_array()
+            .is_some_and(|servers| {
+                servers.iter().any(|server| {
+                    server
+                        .get("status")
+                        .and_then(|status| status.get("status"))
+                        .and_then(Value::as_str)
+                        == Some("pending")
+                })
+            })
     }
 
     /// Is the session mid-turn? V1 keeps a status map on `/session/status`;
@@ -1742,6 +1891,45 @@ fn merge_skill_commands(skills: &mut Vec<zeron_proto::invocation::Skill>, comman
     }
 }
 
+/// OpenCode's own TUI actions, which are not `/command` entries: its
+/// interface handles `/compact` itself, and the server has the endpoint
+/// behind it (`POST /api/session/{id}/compact`). Listed so the composer can
+/// offer it; `post_prompt` sends it there. (1.x has no such endpoint.)
+fn tui_commands(protocol: Protocol) -> Vec<SlashCommand> {
+    if protocol != Protocol::V2 {
+        return Vec::new();
+    }
+    vec![SlashCommand {
+        name: "compact".into(),
+        description: "Compact this session".into(),
+        input_hint: None,
+    }]
+}
+
+/// The agent plan mode switches to, from `GET /api/agent`: the primary one
+/// whose rules keep it from editing. (Zeron's configuration adds one; a
+/// person may hide it, or add a read-only agent of their own.)
+fn plan_agent_from(list: &Value) -> Option<String> {
+    list.as_array().into_iter().flatten().find_map(|agent| {
+        if agent.get("mode").and_then(Value::as_str) != Some("primary") {
+            return None;
+        }
+        let read_only = agent
+            .get("permissions")
+            .and_then(Value::as_array)
+            .is_some_and(|rules| {
+                rules.iter().any(|rule| {
+                    rule.get("action").and_then(Value::as_str) == Some("edit")
+                        && rule.get("effect").and_then(Value::as_str) == Some("deny")
+                })
+            });
+        read_only
+            .then(|| agent.get("id").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_owned)
+    })
+}
+
 fn commands_from_wire(commands: &Value) -> Vec<SlashCommand> {
     commands
         .as_array()
@@ -1861,6 +2049,8 @@ struct Session {
     kill_grace: Duration,
     bus_timeouts: BusTimeouts,
     known_commands: Option<Vec<SlashCommand>>,
+    /// The agent a session was on before plan mode switched it away.
+    plan_return: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     /// True only when the composer supplied a canonical leading command or
     /// provider-backed skill. Raw slash text deliberately stays false.
     initial_native_command_selected: bool,
@@ -2056,6 +2246,7 @@ async fn run_session(session: Session) {
         bus_timeouts,
         known_commands,
         initial_native_command_selected,
+        plan_return,
     } = session;
     let RunControls {
         realtime: _,
@@ -2073,10 +2264,11 @@ async fn run_session(session: Session) {
     // Plan mode as of the live prompt: 1.x names the plan agent on each
     // prompt, 2.x holds it on the session (and keeps it there across runs).
     let mut plan = request.plan;
+    let plan_agent = server.plan_agent(dir).await;
     let agent = if plan {
-        Some(PLAN_AGENT)
+        plan_agent.clone()
     } else {
-        chosen_agent(&request)
+        chosen_agent(&request).map(str::to_owned)
     };
 
     // ---- session create/resume -------------------------------------------
@@ -2091,12 +2283,34 @@ async fn run_session(session: Session) {
                             .and_then(Value::as_str)
                             .unwrap_or(resume)
                             .to_owned();
-                        // A session a plan-mode run left on the plan agent
-                        // goes back to the default one.
-                        let agent = agent.or_else(|| {
-                            (info.get("agent").and_then(Value::as_str) == Some(PLAN_AGENT))
-                                .then_some(DEFAULT_AGENT)
-                        });
+                        // The agent the session is on, and the one it was on
+                        // before plan mode: leaving plan goes back to that.
+                        let current = info
+                            .get("agent")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                        let remembered = if !plan && current.as_deref() == plan_agent.as_deref()
+                        {
+                            plan_return.lock().await.remove(&id)
+                        } else {
+                            None
+                        };
+                        if plan
+                            && let Some(current) = current.as_deref()
+                            && Some(current) != plan_agent.as_deref()
+                        {
+                            plan_return
+                                .lock()
+                                .await
+                                .insert(id.clone(), current.to_owned());
+                        }
+                        let agent = agent_switch(
+                            plan,
+                            plan_agent.as_deref(),
+                            current.as_deref(),
+                            chosen_agent(&request),
+                            remembered,
+                        );
                         if server.protocol().await == Protocol::V2
                             && let Some(agent) = agent
                         {
@@ -2115,11 +2329,39 @@ async fn run_session(session: Session) {
                             target: "zeron_harness::opencode",
                             "session resume failed (starting fresh): {e}"
                         );
-                        create_session(&server, dir, agent).await?
+                        create_session(&server, dir, agent.as_deref()).await?
                     }
                 }
             }
-            None => create_session(&server, dir, agent).await?,
+            None => {
+                // (A session made in plan mode is made on the server's own
+                // default first, so leaving plan has somewhere to go back to.)
+                let created =
+                    create_session(&server, dir, if plan { None } else { agent.as_deref() })
+                        .await?;
+                if plan
+                    && server.protocol().await == Protocol::V2
+                    && let Some(plan_agent) = plan_agent.as_deref()
+                {
+                    if let Ok(info) = server.session_info(&created, dir).await
+                        && let Some(current) = info.get("agent").and_then(Value::as_str)
+                        && current != plan_agent
+                    {
+                        plan_return
+                            .lock()
+                            .await
+                            .insert(created.clone(), current.to_owned());
+                    }
+                    server
+                        .post_json(
+                            &format!("/api/session/{created}/agent"),
+                            dir,
+                            &json!({ "agent": plan_agent }),
+                        )
+                        .await?;
+                }
+                created
+            }
         };
 
         // Provider catalog: resolves the model's advertised reasoning
@@ -2209,11 +2451,16 @@ async fn run_session(session: Session) {
     // Advertise slash commands (composer popup); a warm cache skips the call.
     let commands = match known_commands {
         Some(commands) => commands,
-        None => server
-            .commands_wire(dir)
-            .await
-            .map(|v| commands_from_wire(&v))
-            .unwrap_or_default(),
+        None => {
+            let protocol = server.protocol().await;
+            let mut commands = server
+                .commands_wire(dir)
+                .await
+                .map(|v| commands_from_wire(&v))
+                .unwrap_or_default();
+            commands.extend(tui_commands(protocol));
+            commands
+        }
     };
     if !commands.is_empty()
         && !send(
@@ -2407,7 +2654,9 @@ async fn run_session(session: Session) {
                 }
                 let steer = texts.join("\n\n");
                 let adopted = match config {
-                    Some(next) => adopt_config(&server, &session_id, dir, &next, &mut plan)
+                    Some(next) => {
+                        adopt_config(&server, &session_id, dir, &next, &mut plan, &plan_return)
+                    }
                         .await
                         .map(|selection| (model, variant) = selection),
                     None => Ok(()),
@@ -2815,7 +3064,7 @@ async fn run_session(session: Session) {
                             }).await;
                             let adopted = match &steer.config {
                                 Some(next) => {
-                                    adopt_config(&server, &session_id, dir, next, &mut plan)
+                                    adopt_config(&server, &session_id, dir, next, &mut plan, &plan_return)
                                         .await
                                         .map(|selection| (model, variant) = selection)
                                 }
@@ -3177,6 +3426,7 @@ async fn adopt_config(
     dir: Option<&str>,
     next: &RunRequest,
     plan: &mut bool,
+    plan_return: &Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 ) -> Result<(Option<(String, String)>, Option<String>), HarnessError> {
     let providers = server.provider_catalog(dir).await.unwrap_or_default();
     let (model, variant) = model_selection(&providers, next);
@@ -3187,28 +3437,69 @@ async fn adopt_config(
             .await?;
     }
     if v2 && next.plan != *plan {
-        let agent = if next.plan {
-            PLAN_AGENT
+        let plan_agent = server.plan_agent(dir).await;
+        let current = server
+            .session_info(session_id, dir)
+            .await
+            .ok()
+            .and_then(|info| info.get("agent").and_then(Value::as_str).map(str::to_owned));
+        let remembered = if !next.plan && current.as_deref() == plan_agent.as_deref() {
+            plan_return.lock().await.remove(session_id)
         } else {
-            chosen_agent(next).unwrap_or(DEFAULT_AGENT)
+            None
         };
-        server
-            .post_json(
-                &format!("/api/session/{session_id}/agent"),
-                dir,
-                &json!({ "agent": agent }),
-            )
-            .await?;
+        if next.plan
+            && let Some(current) = current.as_deref()
+            && Some(current) != plan_agent.as_deref()
+        {
+            plan_return
+                .lock()
+                .await
+                .insert(session_id.to_owned(), current.to_owned());
+        }
+        let agent = agent_switch(
+            next.plan,
+            plan_agent.as_deref(),
+            current.as_deref(),
+            chosen_agent(next),
+            remembered,
+        );
+        if let Some(agent) = agent {
+            server
+                .post_json(
+                    &format!("/api/session/{session_id}/agent"),
+                    dir,
+                    &json!({ "agent": agent }),
+                )
+                .await?;
+        }
     }
     *plan = next.plan;
     Ok((model, variant))
 }
 
 /// opencode's read-only planning agent, and the agent it hands back to.
-const PLAN_AGENT: &str = "plan";
-const DEFAULT_AGENT: &str = "build";
 
 /// The agent picked in the model's Agent option (2.x), if any.
+/// Which agent a run puts a session on: the plan agent while plan mode is
+/// on; coming off it, the agent the session was on before plan mode, else
+/// the one the person picked. `None` leaves the session as it is.
+fn agent_switch(
+    plan: bool,
+    plan_agent: Option<&str>,
+    current: Option<&str>,
+    picked: Option<&str>,
+    remembered: Option<String>,
+) -> Option<String> {
+    if plan {
+        return plan_agent.map(str::to_owned);
+    }
+    if current == plan_agent {
+        return remembered.or_else(|| picked.map(str::to_owned));
+    }
+    picked.map(str::to_owned)
+}
+
 fn chosen_agent(request: &RunRequest) -> Option<&str> {
     request
         .model_options
@@ -3407,7 +3698,11 @@ async fn post_prompt(
     } = spec;
     let protocol = server.protocol().await;
     // A prompt or command naming no agent runs the default one.
-    let agent = (plan && protocol == Protocol::V1).then_some(PLAN_AGENT);
+    let agent = if plan && protocol == Protocol::V1 {
+        server.plan_agent(dir).await
+    } else {
+        None
+    };
     if let Some((name, arguments)) =
         native_command_request(prompt, commands, native_command_selected)?
     {
@@ -3416,6 +3711,38 @@ async fn post_prompt(
                 "OpenCode commands cannot include attachments; send them in a separate prompt"
                     .into(),
             ));
+        }
+        // `/compact` is OpenCode's own TUI action, not a `/command` entry:
+        // the server has a session endpoint behind it instead.
+        if name == "compact" && protocol == Protocol::V2 {
+            let path = format!("/api/session/{session_id}/compact");
+            let server = server.handle();
+            let dir_owned = dir.map(str::to_owned);
+            let path_owned = path.clone();
+            let updates = updates.clone();
+            tokio::spawn(async move {
+                // (It reads an object, even an empty one.)
+                let mut req = server
+                    .request(reqwest::Method::POST, &path_owned)
+                    .json(&json!({}));
+                req = server.scoped(req, dir_owned.as_deref()).await;
+                let failure = match req.send().await {
+                    Ok(response) if response.status().is_success() => None,
+                    Ok(response) => {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        Some(post_error_message(&path_owned, status, &body))
+                    }
+                    Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
+                };
+                if let Some(message) = failure {
+                    let _ = updates.send(TurnUpdate {
+                        generation: turn_generation,
+                        signal: TurnSignal::CommandFailed(message),
+                    });
+                }
+            });
+            return Ok(false);
         }
         // 1.x names the args `arguments`; 2.x `text`.
         let (path, mut cmd_body) = match protocol {

@@ -382,6 +382,27 @@ pub trait Harness: Send + Sync {
         }
         skills::discover(self.id(), cwd).await.map(Some)
     }
+    /// Whether `revert` does anything here: a rewind shows only where the
+    /// agent's own session can follow it.
+    fn supports_revert(&self) -> bool {
+        false
+    }
+    /// Make the agent's own session forget everything from the prompt at
+    /// `user_index` on (0-based, counting the session's user messages), or
+    /// from the last prompt that reads `text` when the count doesn't line up
+    /// (a command turn leaves no user message of its own). Its own ids are
+    /// its own, so the prompt is named by its place, not by Zeron's id.
+    /// `Ok(false)` when the harness has no such notion (the transcript is
+    /// still rewound; the next turn simply carries the old context).
+    async fn revert(
+        &self,
+        _session_id: &str,
+        _user_index: usize,
+        _text: &str,
+        _cwd: &std::path::Path,
+    ) -> Result<bool, HarnessError> {
+        Ok(false)
+    }
     /// Run an isolated title request. Drivers must opt in with title-specific
     /// instructions and restrictions; never fall back to an ordinary coding run.
     async fn run_title(
