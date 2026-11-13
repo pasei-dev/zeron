@@ -204,8 +204,11 @@ impl Config {
             return Err(format!("~/{dir} is the production engine's"));
         }
         let bin = var("ZERON_ZGX_ENGINE_BIN").map(|p| expand(&p, home)).or_else(|| {
-            // This checkout's: apps/zgx is two below the repository's root.
-            let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zeron-engine");
+            // This checkout's, built the way this app was: apps/zgx is two
+            // below the repository's root.
+            let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+            let built = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../target/{profile}/zeron-engine"));
             built.exists().then_some(built)
         });
         Ok(Self {
