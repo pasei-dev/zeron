@@ -722,6 +722,7 @@
     },
     "transcript": {
       "copy_message": "拷贝消息",
+      "rewind_message": "回到这条消息",
       "switched": "已从 {from} 切换到 {to}",
       "message_from": "消息来自",
       "not_delivered": "未送达——重新发送",
@@ -2717,6 +2718,11 @@
       "new_side_chat": "新建侧边对话",
       "side_chat": "侧边对话",
       "couldnt_create": "无法创建侧边对话。"
+    },
+    "rewind": {
+      "running": "请先停下这一轮",
+      "running_body": "助手仍在写这段对话。",
+      "failed": "无法回到那条消息"
     },
     "zeron_commands": {
       "model": "Zeron：选择智能体、模型和推理强度",

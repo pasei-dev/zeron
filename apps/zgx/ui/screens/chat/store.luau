@@ -30,6 +30,8 @@
 -- "missing" (no such chat), "failed".
 
 local Transcript = require("@ds/transcript")
+local toast = require("@ds/toast")
+local locale = require("@ds/locale")
 local ds = require("@ds")
 local shared = require("@app/screens/chat/shared")
 local prefs = require("@app/screens/settings/prefs")
@@ -174,6 +176,30 @@ end
 -- A prompt that wasn't delivered, sent again.
 function M.retry(id: string, message: string)
 	quietly(ui.call("chat.retry", { id = id, message = message }))
+end
+
+-- Go back to a message: it and everything after it go from the transcript,
+-- the agent's own session forgets the same, and its words come back to the
+-- composer to send again (OpenCode's revert).
+function M.rewind(id: string, message: string, text: string)
+	local open = M.session:peek()
+	if open and open.id == id and open.running then
+		toast.show {
+			title = locale.s("chat.rewind.running"),
+			body = locale.s("chat.rewind.running_body"),
+			tone = "warning",
+		}
+		return
+	end
+	ui.call("chat.rewind", { chat = id, message = message }):after(function()
+		M.insert(text)
+	end, function(err: any)
+		toast.show {
+			title = locale.s("chat.rewind.failed"),
+			body = tostring(err),
+			tone = "danger",
+		}
+	end)
 end
 
 function M.interrupt(id: string)

@@ -102,6 +102,10 @@ pub mod methods {
     /// fresh chat2 socket, host nudge, drain pass, and a new delivery escort
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
+    /// Rewind a chat to one of its messages: that message and everything
+    /// after it go from the transcript, and the agent's own session is told
+    /// to forget the same. `{ chatId, messageId }` → `{ removed }`.
+    pub const REWIND_CHAT: &str = "RewindChat";
     pub const FORK_SIDE_CHAT: &str = "ForkSideChat";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
     /// Explicit user navigation, `{chatId}`. Prioritizes this device's sync

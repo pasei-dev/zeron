@@ -106,6 +106,21 @@ local function Session(id: Id?): Node
 			(panel.open_file :: any)(id, r.path, route.project:peek(), { line = r.line, column = r.column, end_line = r.end_line })
 		end
 	end
+	-- Whether this chat can go back to an earlier message: only where the
+	-- agent's own session forgets the same, so the two agree afterwards.
+	local function can_rewind(): boolean
+		local s = store.session:get()
+		if not s or s.id ~= which() then
+			return false
+		end
+		for _, h in store.catalog:get().harnesses or {} do
+			if h.id == s.harness then
+				return h.revert == true
+			end
+		end
+		return false
+	end
+
 	-- Watch the session the page is on, and let it go as the page goes.
 	ui.effect(function()
 		store.open(which())
@@ -287,6 +302,14 @@ local function Session(id: Id?): Node
 									store.retry(s, message)
 								end
 							end,
+							on_rewind = if can_rewind()
+								then function(message: string, text: string)
+									local s = which()
+									if s then
+										store.rewind(s, message, text)
+									end
+								end
+								else nil,
 							on_attach = shared.attach_quote,
 							pictures = pictures,
 							sent_pictures = sent_pictures,

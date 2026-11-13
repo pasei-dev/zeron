@@ -875,6 +875,19 @@ impl ChatDocHandle {
         lock(&self.chat2).is_some()
     }
 
+    /// Rewind the transcript to `message_id`: that entry and everything after
+    /// it go. Returns the ids that went, or `None` when the message isn't in
+    /// the transcript (already rewound, or another chat's).
+    pub fn truncate_from(&self, message_id: &str) -> Result<Option<Vec<String>>, DocError> {
+        let entries = self.doc.read_entries()?;
+        let Some(at) = entries.iter().position(|entry| entry.id == message_id) else {
+            return Ok(None);
+        };
+        let removed: Vec<String> = entries[at..].iter().map(|entry| entry.id.clone()).collect();
+        self.doc.truncate_messages(at)?;
+        Ok(Some(removed))
+    }
+
     /// Write a complete user message entry, idempotent by id (the client-minted message
     /// id — a re-executed command or optimistic echo never duplicates the entry).
     pub fn write_user_message(

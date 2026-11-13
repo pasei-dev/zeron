@@ -74,6 +74,8 @@ pub const BLOCKED: &[&str] = &[
     "chat.queue_edit",
     "chat.queue_finish",
     "chat.retry",
+    // (Drops a conversation's history: a preview's to ask for, never to do.)
+    "chat.rewind",
     // (Only one that says what an agent may do unasked: `chat.configure`.)
     "chat.configure",
     "agents.install",
@@ -465,7 +467,7 @@ mod tests {
         set(None);
         assert!(refuse("terminal.start").is_ok(), "nothing in preview: all allowed");
         set(Some(Preview { id: "agent".into(), name: "Agent's".into() }));
-        for action in ["terminal.start", "terminal.write", "account.sign_out", "account.delete", "plugins.install", "templates.use", "files.write", "chat.send", "chat.respond", "chat.retry", "chat.queue_edit", "chat.queue_finish", "chat.configure", "files.open_external"] {
+        for action in ["terminal.start", "terminal.write", "account.sign_out", "account.delete", "plugins.install", "templates.use", "files.write", "chat.send", "chat.respond", "chat.retry", "chat.rewind", "chat.queue_edit", "chat.queue_finish", "chat.configure", "files.open_external"] {
             assert!(refuse(action).is_err(), "{action}");
         }
         for action in ["files.read", "files.list", "chat.open", "appearance", "templates.review", "sessions.seen"] {

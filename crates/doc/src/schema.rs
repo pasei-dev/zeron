@@ -585,6 +585,21 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Drop every entry from `from_index` on — a rewind: the transcript goes
+    /// back to the message the person wants to send again, and the agent's
+    /// own session is told to forget the rest. Returns how many went.
+    pub fn truncate_messages(&self, from_index: usize) -> Result<usize, DocError> {
+        let messages = self.doc.get_list("messages");
+        let len = messages.len();
+        if from_index >= len {
+            return Ok(0);
+        }
+        let removed = len - from_index;
+        messages.delete(from_index, removed)?;
+        self.doc.commit();
+        Ok(removed)
+    }
+
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
@@ -1708,6 +1723,34 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].role, MessageRole::System);
         assert_eq!(entries[0].parts, vec![seam]);
+    }
+
+    #[test]
+    fn truncate_messages_drops_the_tail_and_keeps_the_head() {
+        let doc = SessionDoc::init("rewind").unwrap();
+        for (at, id) in ["first", "second", "third"].iter().enumerate() {
+            doc.push_message(&SessionMessageEntry {
+                duration_ms: None,
+                id: (*id).into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "t0".into(),
+                    text: (*id).into(),
+                }],
+                created_at: at as i64,
+                device_id: "dev".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(doc.truncate_messages(1).unwrap(), 2);
+        let left = doc.read_entries().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "first");
+        // (Past the end is nothing to do, not an error.)
+        assert_eq!(doc.truncate_messages(9).unwrap(), 0);
+        assert_eq!(doc.read_entries().unwrap().len(), 1);
     }
 
     #[test]

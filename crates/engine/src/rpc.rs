@@ -3192,6 +3192,74 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
+            methods::REWIND_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct RewindParams {
+                    chat_id: String,
+                    message_id: String,
+                }
+                let p: RewindParams = parse_params(params)?;
+                let chat = self
+                    .workspace
+                    .chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| RpcError::Failed("Chat no longer exists".into()))?;
+                let doc = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let entries = doc
+                    .doc()
+                    .read_entries()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let at = entries
+                    .iter()
+                    .position(|entry| entry.id == p.message_id)
+                    .ok_or_else(|| {
+                        RpcError::Failed("That message is no longer in the chat".into())
+                    })?;
+                // The agent's own session first: if that fails the transcript
+                // stays as it is, since a rewind that only half happened reads
+                // as the agent answering a message that is gone. The agent's
+                // ids are its own, so the prompt is named by its place among
+                // the transcript's user messages.
+                if let (Some(harness), Some(session), Some(cwd)) = (
+                    chat.config.as_ref().map(|config| config.harness),
+                    chat.harness_session_id.clone(),
+                    chat.harness_session_cwd.clone(),
+                ) {
+                    let user_index = entries[..at]
+                        .iter()
+                        .filter(|entry| entry.role == zeron_doc::MessageRole::User)
+                        .count();
+                    let text = entries[at]
+                        .parts
+                        .iter()
+                        .find_map(|part| match part {
+                            zeron_doc::MessagePart::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.registry
+                        .revert(
+                            harness,
+                            &session,
+                            user_index,
+                            text,
+                            std::path::Path::new(&cwd),
+                        )
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                let removed = doc
+                    .truncate_from(&p.message_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?
+                    .ok_or_else(|| {
+                        RpcError::Failed("That message is no longer in the chat".into())
+                    })?;
+                RpcReply::value(&removed)
+            }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]

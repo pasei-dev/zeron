@@ -639,6 +639,7 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
         let v = pick(&args);
         async move { crate::plugins::preview::refuse("chat.retry")?; v.retry(args).await.map(|_| Value::Nil).map_err(String::from) }
     });
+    host.async_action("chat.rewind", move |args| async move { rewind(args).await.map_err(String::from) });
     let pick = which.clone();
     host.async_action("chat.queue_edit", move |args| {
         let v = pick(&args);
@@ -653,6 +654,19 @@ pub fn install(_cx: &mut WindowContext, host: &ScriptHost) {
     // `ensure_refs`): `{ path, device? }`, the device only when it isn't this
     // one (the engine forwards it there).
     host.async_action("chat.refs", move |args| async move { refs(args).await.map_err(String::from) });
+}
+
+/// Go back to a message: it and everything after it go from the transcript,
+/// and the agent's own session forgets the same (the engine's `RewindChat`).
+/// `{ chat, message }`.
+async fn rewind(args: Value) -> Result<Value, Outcome> {
+    let chat = args.field("chat").map(text).filter(|s| !s.is_empty()).ok_or("missing")?;
+    let message = args.field("message").map(text).filter(|s| !s.is_empty()).ok_or("missing")?;
+    engine::get()
+        .call("RewindChat", json!({ "chatId": chat, "messageId": message }))
+        .await
+        .map_err(|e| engine::outcome(&e))?;
+    Ok(Value::Nil)
 }
 
 /// Where a subagent's uploaded transcript is: `{chat}/{doc}`, the chat it
@@ -1207,6 +1221,8 @@ fn catalog_of(listed: &[Json], by: &HashMap<String, Vec<Json>>, done: bool, devi
             ("mark", Value::from(mark(id).as_str())),
             // An agent added from the ACP registry draws its own icon.
             ("icon", h["icon"].as_str().map_or(Value::Nil, Value::from)),
+            // (A chat on it can go back to an earlier message.)
+            ("revert", Value::Bool(h["revert"].as_bool() == Some(true))),
         ]));
         for m in list {
             models.push(model_value(id, m));

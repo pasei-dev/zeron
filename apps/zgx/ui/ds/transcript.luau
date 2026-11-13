@@ -124,6 +124,9 @@ export type Props = {
 	on_attach: ((q: Quote.Quote) -> ())?,
 	-- A prompt that wasn't delivered, sent again (by its id).
 	on_retry: ((id: string) -> ())?,
+	-- Go back to a prompt: it and everything after it go, and its words come
+	-- back to the composer (OpenCode's revert). Its text comes along.
+	on_rewind: ((id: string, text: string) -> ())?,
 	-- "Jump to latest" pressed. (It has the keys, and leaves as the view
 	-- arrives: this says where they go instead of the next control's, which
 	-- may be another chat's.)
@@ -257,7 +260,7 @@ local LANE_TOP = 8
 -- holding only those, not a state per message.
 local COPIED = ui.state("transcript_copied", {} :: { [string]: boolean })
 
-local function strip(m: Message, row: State<Message>, hovered: () -> boolean): Node
+local function strip(m: Message, row: State<Message>, hovered: () -> boolean, on_rewind: ((id: string, text: string) -> ())?): Node
 	local mine = m.role == "user"
 	local function set_copied(on: boolean)
 		local all = table.clone(COPIED:peek())
@@ -334,6 +337,34 @@ local function strip(m: Message, row: State<Message>, hovered: () -> boolean): N
 							end,
 							size = 14,
 						},
+					}
+				),
+				-- (A prompt's own: back to it, its words and all.)
+				ui.show(
+					function(): boolean
+						return mine and on_rewind ~= nil
+					end,
+					ui.button {
+						label = locale.t("ds.transcript.rewind_message"),
+						tooltip = locale.s("ds.transcript.rewind_message"),
+						w = 24,
+						h = 24,
+						p = 0,
+						items = "center",
+						justify = "center",
+						rounded = "$radius.md",
+						bg = "#00000000",
+						color = "$text.secondary",
+						hover = { bg = "$zeron.secondary.bg" },
+						active = { bg = "$zeron.secondary.hover" },
+						focus = control.ring,
+						cursor = "pointer",
+						on_click = function()
+							if on_rewind then
+								on_rewind(m.id, m.text)
+							end
+						end,
+						Icon { name = "arrow-left", size = 14 },
 					}
 				),
 				-- Where plugins add a message's actions: beside Copy.
@@ -1671,7 +1702,7 @@ local function Transcript(props: Props): Node
 							pictures = props.sent_pictures,
 							find = if find_for then find_for(`{m.id}:u`) else nil,
 						},
-						strip(m, state, hovered),
+						strip(m, state, hovered, props.on_rewind),
 						waiting_line(state, props.on_retry),
 					}
 					else reply(m, state, props.draft, hovered, props.compact, { view = list, offset = offset, at_end = at_end, row = outer, pictures = props.pictures, shown_pictures = props.sent_pictures, open = props.open_link, link_menu = props.link_menu, open_subagent = props.on_open_subagent, find = find_for }),

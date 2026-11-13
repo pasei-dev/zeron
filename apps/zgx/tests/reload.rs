@@ -64,6 +64,7 @@ const CALLS: &[&str] = &[
     "chat.queue_finish",
     "chat.respond",
     "chat.retry",
+    "chat.rewind",
     "chat.send",
     "files.create",
     "files.delete",

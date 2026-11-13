@@ -722,6 +722,7 @@
     },
     "transcript": {
       "copy_message": "Copy message",
+      "rewind_message": "Go back to this message",
       "switched": "Switched from {from} to {to}",
       "message_from": "Message from",
       "not_delivered": "Not delivered — send again",
@@ -2717,6 +2718,11 @@
       "new_side_chat": "New side chat",
       "side_chat": "Side chat",
       "couldnt_create": "Couldn't create the side chat."
+    },
+    "rewind": {
+      "running": "Stop the turn first",
+      "running_body": "The agent is still writing into this conversation.",
+      "failed": "Couldn't go back to that message"
     },
     "zeron_commands": {
       "model": "Zeron: choose agent, model, and reasoning",
